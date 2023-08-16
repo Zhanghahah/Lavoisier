@@ -1,93 +1,23 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-# @Time: 2023/05/21
-# @Author: cynthiazhang
+# DeepSpeed Team
 import argparse
 import logging
 import torch
 import sys
 import os
-import numpy as np
-from tqdm import tqdm
 import json
 
 from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-)
-from torch.utils.data import Subset
+    AutoModelForCausalLM, )
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
-
-sys.path.append(
-        os.path.abspath(
-            os.path.join(os.path.dirname(__file__),
-            os.path.pardir, "tmp_logs")
-        ))
-
-from utils.data.data_utils import get_raw_dataset
 from utils.model.model_utils import create_hf_model
+from utils.utils import load_hf_tokenizer
 
 logger = logging.getLogger(__name__)
-
-class ChemEval:
-    def __init__(self):
-        self.output_path_prefix = "/tmp/data_files/"
-        self.dataset_name = "yuyuc/chem-uspto"
-        self.index_file_name = "yuyuc_chem_uspto_seed1234_train_2,4,4_1.npy"
-        self.retrosysthesis = "Retrosynthesis.txt"
-
-    @staticmethod
-    def parse_json(path):
-        with open(path) as r:
-            data = r.readlines()
-        return data
-
-    def load_test_from_index_file(self):
-        raw_dataset = get_raw_dataset(self.dataset_name, self.output_path_prefix,
-                                      None, 0)
-        test_dataset = raw_dataset.get_train_data()
-        index_file_name = os.path.join(self.output_path_prefix,
-                                       self.index_file_name)
-        test_index = np.load(index_file_name, allow_pickle=True).tolist()
-        test_dataset = Subset(test_dataset, test_index)
-
-        return test_dataset, raw_dataset
-
-
-def batch_prompt_eval(args, test_dataset, raw_dataset,
-                      tokenizer,
-                      model_baseline, model_fintuned,
-                      base_device, ft_device
-                      ):
-    for i, tmp_data in enumerate(test_dataset):
-        base_prompts = raw_dataset.get_prompt_and_chosen(tmp_data)
-        base_inputs = tokenizer(base_prompts, return_tensors="pt").to(base_device)
-        ft_prompts = raw_dataset.get_prompt_and_chosen(tmp_data)
-        ft_inputs = tokenizer(ft_prompts, return_tensors="pt").to(ft_device)
-
-        print("==========Baseline: Greedy=========")
-        r_base = generate(model_baseline,
-                          tokenizer,
-                          base_inputs,
-                          num_beams=1,
-                          num_return_sequences=args.num_return_sequences,
-                          max_new_tokens=args.max_new_tokens)
-        print_utils(r_base)
-        print("==========finetune: Greedy=========")
-        r_finetune_g = generate(model_fintuned,
-                                tokenizer,
-                                ft_inputs,
-                                num_beams=1,
-                                num_return_sequences=args.num_return_sequences,
-                                max_new_tokens=args.max_new_tokens)
-        print_utils(r_finetune_g)
-        print("====================prompt end=============================")
-        print()
-        print()
 
 
 def parse_args():
@@ -137,7 +67,7 @@ def parse_args():
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=512,
+        default=100,
         help='Specify num of return sequences',
     )
     parser.add_argument("--language",
@@ -199,22 +129,14 @@ def print_utils(gen_output):
         print()
 
 
-def prompt_eval(args,
-                model_baseline, model_fintuned,
-                tokenizer,
-                base_device, ft_device,
+def prompt_eval(args, model_baseline, model_fintuned, tokenizer, device,
                 prompts):
-    total_length = len(prompts)
-
-    for i in tqdm(range(0, total_length)):
-        prompt = prompts[i]
-        # tmp_output = dict()
-        base_inputs = tokenizer(prompt, return_tensors="pt").to(base_device)
-        ft_inputs = tokenizer(prompt, return_tensors="pt").to(ft_device)
+    for prompt in prompts:
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
         print("==========Baseline: Greedy=========")
         r_base = generate(model_baseline,
                           tokenizer,
-                          base_inputs,
+                          inputs,
                           num_beams=1,
                           num_return_sequences=args.num_return_sequences,
                           max_new_tokens=args.max_new_tokens)
@@ -222,20 +144,11 @@ def prompt_eval(args,
         print("==========finetune: Greedy=========")
         r_finetune_g = generate(model_fintuned,
                                 tokenizer,
-                                ft_inputs,
+                                inputs,
                                 num_beams=1,
                                 num_return_sequences=args.num_return_sequences,
                                 max_new_tokens=args.max_new_tokens)
-        # print(r_finetune_g)
         print_utils(r_finetune_g)
-        response = r_finetune_g[0].split("Assistant:")[1].split("<|endoftext|>")[0]
-        print(response)
-        # tmp_output["Reactants"] = reactants[i]
-        # tmp_output["Products"] = products[i]
-        # tmp_output["Condition"] = response
-        # json_str = json.dumps(tmp_output, ensure_ascii=False) + "\n"
-        # json_file.write(json_str)
-
         # Note: we use the above simplest greedy search as the baseline. Users can also use other baseline methods,
         # such as beam search, multinomial sampling, and beam-search multinomial sampling.
         # We provide examples as below for users to try.
@@ -281,13 +194,11 @@ def prompt_eval(args,
 
 def main():
     args = parse_args()
-    finetuned_device = torch.device("cuda:0")
-    baseline_device = torch.device("cuda:1")
 
-    # device = torch.device("cuda:1")
-    config = AutoConfig.from_pretrained(args.model_name_or_path_baseline)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path_baseline,
-                                              fast_tokenizer=True)
+    device = torch.device("cuda:0")
+
+    tokenizer = load_hf_tokenizer(args.model_name_or_path_baseline,
+                                  fast_tokenizer=True)
 
     model_baseline = create_hf_model(AutoModelForCausalLM,
                                      args.model_name_or_path_baseline,
@@ -296,60 +207,22 @@ def main():
                                      args.model_name_or_path_finetune,
                                      tokenizer, None)
 
-    model_baseline.to(baseline_device)
-    model_fintuned.to(finetuned_device)
-
-    # chem_eval = ChemEval()
-    # test_dataset, raw_dataset = chem_eval.load_test_from_index_file()
-    # batch_prompt_eval(args, test_dataset, raw_dataset,
-    #                   tokenizer,
-    #                   model_baseline, model_fintuned,
-    #                   baseline_device, finetuned_device
-    #                   )
-
-    raw_instruct_data = ChemEval.parse_json(
-        "/home/zhangyu/simple-chem-benchmarks/scripts/llama_chem_v2.json"
-    )
-    total_test_index = np.load(
-        "/home/zhangyu/simple-chem-benchmarks/scripts/test_index.npy",
-        allow_pickle=True).tolist()
-    test_prompts = []
-    for index in total_test_index:
-        test_prompts.append("Human: " + \
-                            json.loads(raw_instruct_data[index])["INSTRUCTION"] + \
-                            " Assistant:")
-        if len(test_prompts) > 10:
-            break
+    model_baseline.to(device)
+    model_fintuned.to(device)
 
     # One observation: if the prompt ends with a space " ", there is a high chance that
     # the original model (without finetuning) will stuck and produce no response.
     # Finetuned models have less such issue. Thus following prompts all end with ":"
     # to make it a more meaningful comparison.
-    # input_data = chem_eval.parse_json(chem_eval.retrosysthesis)
-
     if args.language == "English":
-        # prompts = []
-        reactants = []
-        products = []
-        # for line in input_data:
-        #     input_dict = json.loads(line)
-        #     reactant = input_dict["Reactants"]
-        #     product = input_dict["Products"]
-        #
-        #     inputs = f"Human: Here is a chemical reaction formula: Reactants are: {reactant}," \
-        #              f"Products are: {product}, please give me the reaction condition of this chemical formula? Assistant:"
-        #     prompts.append(inputs)
-        #     reactants.append(reactant)
-        #     products.append(product)
-        prompts = test_prompts
-        # prompts = [
-        #     "Human: Here is a chemical reaction formula: reactants are an aryl or vinyl halide (R-X) and a boronic acid or boronate ester (R'-B(OR)2), The products are a substituted biphenyl or a styrene derivative. please give me the reaction condition of this chemical formula? Assistant:",
-        #     "Human: Here is a chemical reaction formula: Reactants are amine:CC(C)N1CCNCC1, aryl halide:CCOC1=C(C=C2C(=C1)N=CC(=C2NC3=C(C=C(C=C3)F)F)C(=O)OCC)Br, Products are CCOC1=C(C=C2C(=C1)N=CC(=C2NC3=C(C=C(C=C3)F)F)C(=O)OCC)N4CCN(CC4)C(C)C, please give me the reaction condition of this chemical formula? Assistant:",
-        #     "Human: Here is a chemical reaction formula: Reagents are Base:C(=O)([O-])[O-].[Cs+].[Cs+],Solvents are Solvent:C1COCCO1,Catalysts are metal and ligand:CC1(C2=C(C(=CC=C2)P(C3=CC=CC=C3)C4=CC=CC=C4)OC5=C1C=CC=C5P(C6=CC=CC=C6)C7=CC=CC=C7)C;metal and ligand:C1=CC=C(C=C1)/C=C/C(=O)/C=C/C2=CC=CC=C2.C1=CC=C(C=C1)/C=C/C(=O)/C=C/C2=CC=CC=C2.C1=CC=C(C=C1)/C=C/C(=O)/C=C/C2=CC=CC=C2.[Pd].[Pd].Products are 0:CC(C1=CC(=CC2=C1OC(=CC2=O)N3CCOCC3)C(=O)N(C)C)NC4=CC(=CC(=C4)Cl)F, please give me the reaction condition of this chemical formula？ Assistant:",
-        #     "Human: Here is a chemical reaction formula: Reagents are Base:C(=O)([O-])[O-].[Cs+].[Cs+],Solvents are Solvent:CN(C)C=O,Catalysts are metal and ligand:CC(C)C1=CC(=C(C(=C1)C(C)C)C2=CC=CC=C2P(C(C)(C)C)C(C)(C)C)C(C)C;metal and ligand:C1=CC=C(C=C1)/C=C/C(=O)/C=C/C2=CC=CC=C2.C1=CC=C(C=C1)/C=C/C(=O)/C=C/C2=CC=CC=C2.C1=CC=C(C=C1)/C=C/C(=O)/C=C/C2=CC=CC=C2.[Pd].[Pd].Products are 0:CC(=O)NC1=C(C=CC(=C1)NC2=NC3=C(C=NN3C(=C2)NC4COC4)C#N)C5CC5, please give me the reaction condition of this chemical formula? Assistant:",
-        #     "Human: Here is a chemical reaction formula: Reagents are Base:C(=O)([O-])[O-].[Cs+].[Cs+],Solvents are Solvent:C1COCCO1,Catalysts are metal and ligand:C1=CC=C(C=C1)P(C2=CC=CC=C2)C3=C(C4=CC=CC=C4C=C3)C5=C(C=CC6=CC=CC=C65)P(C7=CC=CC=C7)C8=CC=CC=C8;metal and ligand:CC(=O)O.CC(=O)O.[Pd].Products are 0:C1CN(CCC1O)C2=CC=CC(=C2)C(F)(F)F, please give me the reaction condition of this chemical formula? Assistant:",
-        #     "Human: Here is a chemical reaction formula: Reagents are Base:CC(C)(C)[O-].[K+],Solvents are Solvent:C1CCOC1,Catalysts are metal and ligand:CC(C)(C)P(C(C)(C)C)C(C)(C)C;metal and ligand:CC(C)(C)P(C(C)(C)C)C(C)(C)C.CC(C)(C)P(C(C)(C)C)C(C)(C)C.[Pd].Products are 0:CC(C)[C@@H]1CN(CCN1C(=O)OC(C)(C)C)C2=CC(=C(C=C2)OC)OC, please give me the reaction condition of this chemical formula? Assistant:"
-        # ]
+        prompts = [
+            "Human: Please tell me about Microsoft in a few sentence? Assistant:",
+            "Human: Explain the moon landing to a 6 year old in a few sentences. Assistant:",
+            "Human: Write a short poem about a wise frog. Assistant:",
+            "Human: Who was president of the United States in 1955? Assistant:",
+            "Human: How does a telescope work? Assistant:",
+            "Human: Why do birds migrate south for the winter? Assistant:"
+        ]
     elif args.language == "Chinese":
         prompts = [
             "Human: 请用几句话介绍一下微软? Assistant:",
@@ -368,13 +241,24 @@ def main():
             "Human: 鳥が冬に南に移動するのはなぜですか? Assistant:"
         ]
 
-    prompt_eval(args,
-                model_baseline, model_fintuned,
-                tokenizer,
-                baseline_device, finetuned_device,
+    prompt_eval(args, model_baseline, model_fintuned, tokenizer, device,
                 prompts)
 
 
-if __name__ == "__main__":
+def load_test_prompts():
+    test_data_path = "/home/zhangyu/data/woshi/chem_uspto_instruction_test_v2.json"
+    test_prompts = parse_json(test_data_path)
+    return test_prompts
 
+def parse_json(path):
+    with open(path) as r:
+        data = r.readlines()
+    data_length = len(data)
+    meta_data = []
+    for i in range(data_length):
+        meta_data.append(json.loads(data[i]))
+    return meta_data
+
+
+if __name__ == "__main__":
     main()
